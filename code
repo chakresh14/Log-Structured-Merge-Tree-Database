@@ -1,0 +1,243 @@
+#include <iostream>
+#include <vector>
+#include <map>
+#include <string>
+#include <sstream>
+#include <memory>
+#include <cmath>
+#include <algorithm>
+
+// ============================================================================
+// 1. BLOOM FILTER IMPLEMENTATION
+// ============================================================================
+class BloomFilter {
+private:
+    std::vector<bool> bits;
+    size_t numHashes;
+
+    // Two simple independent hash functions to simulate multiple hashes (Kirsch-Mitzenmacher technique)
+    size_t hash1(const std::string& key) const {
+        return std::hash<std::string>{}(key);
+    }
+    size_t hash2(const std::string& key) const {
+        size_t h = 0;
+        for (char c : key) h = h * 33 + c;
+        return h;
+    }
+
+public:
+    BloomFilter(size_t size = 1000, size_t hashes = 3) : bits(size, false), numHashes(hashes) {}
+
+    void insert(const std::string& key) {
+        size_t h1 = hash1(key);
+        size_t h2 = hash2(key);
+        for (size_t i = 0; i < numHashes; ++i) {
+            size_t idx = (h1 + i * h2) % bits.size();
+            bits[idx] = true;
+        }
+    }
+
+    bool contains(const std::string& key) const {
+        size_t h1 = hash1(key);
+        size_t h2 = hash2(key);
+        for (size_t i = 0; i < numHashes; ++i) {
+            size_t idx = (h1 + i * h2) % bits.size();
+            if (!bits[idx]) return false; // Definitely does not exist
+        }
+        return true; // Might exist
+    }
+};
+
+// ============================================================================
+// 2. SSTABLE (SORTED STRING TABLE) STRUCTURE
+// ============================================================================
+struct SSTable {
+    int id;
+    std::string fileContent;             // Simulating raw file data on disk
+    std::map<std::string, size_t> index; // Sparse index: Maps Key -> Byte Offset in fileContent
+    BloomFilter filter;
+
+    // Factory method to create an SSTable from a sorted list of key-value pairs
+    static std::shared_ptr<SSTable> create(int id, const std::map<std::string, std::string>& data) {
+        auto sstable = std::make_shared<SSTable>();
+        sstable->id = id;
+        
+        std::ostringstream ss;
+        size_t currentOffset = 0;
+
+        for (const auto& [key, val] : data) {
+            sstable->filter.insert(key);
+            sstable->index[key] = currentOffset; // O(log N) binary search index boundary
+
+            std::string line = key + ":" + val + "\n";
+            ss << line;
+            currentOffset += line.length();
+        }
+        sstable->fileContent = ss.str();
+        return sstable;
+    }
+
+    // Direct search inside the SSTable file content
+    std::string search(const std::string& key) {
+        // Step A: Fast Check Bloom Filter
+        if (!filter.contains(key)) {
+            return "FILTER_REJECT"; // Guaranteed not here, saved a slow disk seek!
+        }
+
+        // Step B: Use Sparse Index to locate exact segment boundary
+        auto it = index.find(key);
+        if (it == index.end()) return "NOT_FOUND";
+
+        size_t offset = it->second;
+        std::string targetLine = fileContent.substr(offset, fileContent.find('\n', offset) - offset);
+        
+        size_t sep = targetLine.find(':');
+        return targetLine.substr(sep + 1);
+    }
+};
+
+// ============================================================================
+// 3. MAIN LSM-TREE STORAGE ENGINE
+// ============================================================================
+class LSMTree {
+private:
+    size_t maxMemTableSize;
+    int sstableIdCounter;
+    
+    // Core Layers
+    std::map<std::string, std::string> memTable; // In-memory Red-Black Tree
+    std::vector<std::shared_ptr<SSTable>> levels; // Level 1 Disk storage tier
+
+    void flushMemTable() {
+        if (memTable.empty()) return;
+        std::cout << "[Flush] MemTable capacity exceeded. Flushing to SSTable #" << sstableIdCounter << "...\n";
+        
+        auto newSSTable = SSTable::create(sstableIdCounter++, memTable);
+        levels.push_back(newSSTable);
+        memTable.clear();
+    }
+
+public:
+    LSMTree(size_t maxKeys = 3) : maxMemTableSize(maxKeys), sstableIdCounter(1) {}
+
+    // Write Path: O(log N) into memory buffer
+    void put(const std::string& key, const std::string& value) {
+        memTable[key] = value;
+        if (memTable.size() >= maxMemTableSize) {
+            flushMemTable();
+        }
+    }
+
+    // Delete Path: Insert a "Tombstone" marker
+    void del(const std::string& key) {
+        put(key, "[TOMBSTONE]");
+    }
+
+    // Read Path: MemTable -> SSTables (Newest to Oldest)
+    std::string get(const std::string& key) {
+        // Phase 1: Check memory MemTable
+        if (memTable.find(key) != memTable.end()) {
+            std::string val = memTable[key];
+            if (val == "[TOMBSTONE]") return "KEY_DELETED";
+            return val + " (Found in MemTable)";
+        }
+
+        // Phase 2: Traverse disk levels backwards (Newest SSTables checked first)
+        for (auto it = levels.rbegin(); it != levels.rend(); ++it) {
+            std::string result = (*it)->search(key);
+            if (result == "FILTER_REJECT") {
+                std::cout << "  -> [Bloom Filter] Blocked redundant seek on SSTable #" << (*it)->id << "\n";
+                continue;
+            }
+            if (result == "[TOMBSTONE]") return "KEY_DELETED";
+            if (result != "NOT_FOUND") {
+                return result + " (Found in SSTable #" + std::to_string((*it)->id) + ")";
+            }
+        }
+
+        return "KEY_NOT_FOUND";
+    }
+
+    // Background Worker: Multi-way Merge Compaction
+    void forceCompaction() {
+        std::cout << "\n--- [Compaction Worker] Merging older SSTables to clean garbage ---\n";
+        if (levels.size() < 2) {
+            std::cout << "Not enough SSTables to compact.\n";
+            return;
+        }
+
+        // Merge sort all SSTables chronologically into a single consolidated map
+        std::map<std::string, std::string> mergedData;
+        for (const auto& sstable : levels) {
+            std::istringstream stream(sstable->fileContent);
+            std::string line;
+            while (std::getline(stream, line)) {
+                size_t sep = line.find(':');
+                std::string k = line.substr(0, sep);
+                std::string v = line.substr(sep + 1);
+                
+                // Newer SSTable values naturally overwrite older values during iteration
+                if (v == "[TOMBSTONE]") {
+                    mergedData.erase(k); // Evict deleted data permanently
+                } else {
+                    mergedData[k] = v;
+                }
+            }
+        }
+
+        // Clear out old un-compacted storage segments
+        levels.clear();
+
+        // Write the clean, sorted, minimized payload to a consolidated Level 2 SSTable
+        auto compactedSSTable = SSTable::create(sstableIdCounter++, mergedData);
+        levels.push_back(compactedSSTable);
+        std::cout << "Compaction finished. Active database files compressed into single SSTable #" << compactedSSTable->id << "\n\n";
+    }
+
+    void debugPrint() {
+        std::cout << "\n--- Current Database State ---\n";
+        std::cout << "MemTable size: " << memTable.size() << "\n";
+        std::cout << "Total SSTables on Disk: " << levels.size() << "\n";
+        for (const auto& sst : levels) {
+            std::cout << "  SSTable #" << sst->id << " contents:\n" << sst->fileContent;
+        }
+        std::cout << "-------------------------------\n\n";
+    }
+};
+
+// ============================================================================
+// 4. VERIFICATION RUNNER
+// ============================================================================
+int main() {
+    LSMTree db(3); // Flushes to disk every 3 elements
+
+    std::cout << "1. Inserting initial dataset...\n";
+    db.put("apple", "v1");
+    db.put("banana", "v1");
+    db.put("cherry", "v1"); // Triggers Flush #1 because size reaches 3
+
+    std::cout << "\n2. Updating and introducing new keys...\n";
+    db.put("banana", "v2");  // Update
+    db.put("dragonfruit", "v1"); 
+    db.put("apple", "v2");  // Update -> Triggers Flush #2
+
+    db.debugPrint();
+
+    std::cout << "3. Testing Read Path Routing...\n";
+    std::cout << "Get 'apple': " << db.get("apple") << "\n";   // Should find v2 in SSTable 2
+    std::cout << "Get 'cherry': " << db.get("cherry") << "\n"; // Should find v1 in SSTable 1
+
+    std::cout << "\n4. Simulating a Delete Operation...\n";
+    db.del("cherry"); // Places tombstone marker
+    std::cout << "Get 'cherry': " << db.get("cherry") << "\n";
+
+    std::cout << "\n5. Testing Bloom Filter Performance with a non-existent key...\n";
+    std::cout << "Get 'zebra': " << db.get("zebra") << "\n"; // Bloom filter should skip files entirely
+
+    // Trigger compaction to clear historical updates and processed tombstones
+    db.forceCompaction();
+    db.debugPrint();
+
+    std::cout << "Get 'cherry' after compaction: " << db.get("cherry") << "\n";
+    return 0;
+}
